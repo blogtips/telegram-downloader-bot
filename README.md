@@ -1,29 +1,15 @@
-# Telegram Downloader Bot (Render.com)
+# Telegram Downloader Bot (Render.com) — v2
 
-Bot Telegram nhận link Douyin/TikTok/Facebook/Instagram và gửi lại video (cố gắng không watermark) dùng `yt-dlp`.
-Cách chạy tốt nhất: deploy Web Service trên Render với Docker (long-polling) + endpoint health check `/`.
+Cải tiến:
+- Bắt link từ `entities`/`caption_entities` (URL & TEXT_LINK), regex fallback.
+- Dùng `ChatAction.UPLOAD_VIDEO` đúng chuẩn PTB v21.
+- Logging chi tiết để xem trong Render Logs.
+- Hoạt động cả DM và group (lưu ý Privacy Mode).
 
-## Biến môi trường
-- `TELEGRAM_TOKEN` (bắt buộc): token từ @BotFather
-- `USER_AGENT` (tùy chọn): UA cho request
-- `YTDLP_COOKIES` (tùy chọn): đường dẫn tới cookies file (ví dụ `/app/cookies.txt`) để tải video FB/IG riêng tư
-
-## Chạy local
-```bash
-python -m venv .venv && . .venv/bin/activate
-pip install -r requirements.txt
-export TELEGRAM_TOKEN=xxxxxxxx:yyyy
-python main.py
-```
-
-## Docker local
-```bash
-docker build -t tg-dl-bot .
-docker run -e TELEGRAM_TOKEN=xxxxxxxx:yyyy -p 10000:10000 tg-dl-bot
-```
-
-## Triển khai Render
-- Kết nối repo GitHub, tạo **Web Service**, Runtime Docker, Plan **Free**.
-- Đặt env: `TELEGRAM_TOKEN` (required), `USER_AGENT` tùy chọn, `YTDLP_COOKIES` nếu cần.
-- Health check path `/`.
-- Scale = 1 instance.
+## Gợi ý nếu bot không phản hồi
+1. **Kiểm tra Logs** (Render → Service → Logs). Bạn sẽ thấy dòng `Received URL ...` khi bot nhận tin.
+2. **Bật chat riêng & gửi `/start`** trước khi gửi link (bắt buộc cho lần đầu).
+3. **Group**: nếu dùng trong nhóm, @BotFather `/setprivacy` → **Disable** để bot đọc tin nhắn thường.
+4. **Chỉ 1 instance** chạy polling (Scale=1). Nếu >1 sẽ conflict.
+5. **TELEGRAM_TOKEN** phải đúng.
+6. **Link phải đầy đủ `http(s)://...`** (regex & entity đã hỗ trợ hầu hết trường hợp).

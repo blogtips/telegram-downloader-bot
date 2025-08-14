@@ -40,6 +40,17 @@ def classify(url: str) -> str:
 async def start(update: Update, _: ContextTypes.DEFAULT_TYPE):
     await update.effective_chat.send_message("Chào bạn!\n" + HELP_TEXT)
 
+async def ping(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    await update.effective_chat.send_message("pong ✅")
+
+async def debug(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    text = msg.text or ""
+    cap = msg.caption or ""
+    await update.effective_chat.send_message(
+        f"entities={msg.entities}\ncaption_entities={msg.caption_entities}\ntext={text}\ncaption={cap}"
+    )
+
 def extract_first_url(text: str) -> str | None:
     if not text: return None
     m = URL_RE.search(text)
@@ -49,29 +60,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     msg = update.effective_message
 
-    # Prefer URL entities (handles captions, text link)
+    # Prefer URL entities
     url = None
     if msg and msg.entities:
         for ent in msg.entities:
             if ent.type in ("url", "text_link"):
-                url = ent.url or msg.text[ent.offset: ent.offset + ent.length]
+                url = ent.url or (msg.text or "")[ent.offset: ent.offset + ent.length]
                 break
     if not url and msg and msg.caption_entities:
         for ent in msg.caption_entities:
             if ent.type in ("url", "text_link"):
-                url = ent.url or msg.caption[ent.offset: ent.offset + ent.length]
+                url = ent.url or (msg.caption or "")[ent.offset: ent.offset + ent.length]
                 break
-    # Fallback regex from text/caption
     if not url:
         url = extract_first_url((msg.text or "") + " " + (msg.caption or ""))
 
     if not url:
-        return  # ignore non-URL messages silently
+        return  # ignore non-URL messages
 
     src = classify(url)
     log.info("Received URL from %s: %s (src=%s)", chat.id, url, src)
 
-    # typing/upload indicator
     try:
         await context.bot.send_chat_action(chat_id=chat.id, action=ChatAction.UPLOAD_VIDEO)
     except Exception as e:
@@ -139,11 +148,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def run_polling():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    # Handle text messages (DM & group). Privacy mode may block non-command msgs in groups.
+    app.add_handler(CommandHandler("ping", ping))
+    app.add_handler(CommandHandler("debug", debug))
     app.add_handler(MessageHandler(filters.ALL & (~filters.COMMAND), handle_message))
+
     await app.initialize()
+    # IMPORTANT: ensure webhook is removed, otherwise polling won't receive updates
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+        log.info("Webhook deleted (if existed).")
+    except Exception as e:
+        log.warning("delete_webhook failed: %s", e)
+
     await app.start()
-    await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+    log.info("Polling starting...")
+    await app.updater.start_polling(allowed_updates=None)  # default all types
+    log.info("Polling started and running.")
     await asyncio.Event().wait()
 
 def health_app():

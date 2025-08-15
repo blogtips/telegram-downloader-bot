@@ -1,8 +1,13 @@
-# Telegram Downloader Bot — Render (v5.4)
 
-**Điểm mới v5.4 cho Facebook**:
-- Thử thêm **mbasic.facebook.com** để lộ `video_redirect/?src=` (link file trực tiếp) — nhiều bot downloader dùng mẹo này.
-- Parse cả `plugins/video.php?href=...` từ oEmbed khi video công khai.
-- `/trace` hiển thị danh sách candidates; bạn có thể copy 1 link candidate gửi lại cho bot.
+# Telegram Downloader Bot — Render (v5.5)
 
-Giữ nguyên các tính năng cũ: cookies qua `COOKIES_TXT`, retry Telegram khi deploy, normalize short links, chạy web + polling cùng event loop, lệnh `/get`.
+**Thay đổi chính:**
+- Nếu resolver phát hiện `mbasic.facebook.com/video_redirect/?src=...`, bot sẽ **tải trực tiếp** file (không dùng yt-dlp), tăng tỉ lệ thành công cho các link share.
+- Thêm lệnh `/cookiecheck` để kiểm tra nhanh bot có cookies chưa.
+- Giữ `/get`, `/trace`, retry khi deploy, normalize short links, polling + web.
+
+## Gợi ý debug nhanh
+- `/trace <url>` xem `normalized` + candidates.
+- Nếu có candidate `video_redirect/?src=...` → dùng `/get <candidate>` hoặc gửi thẳng link share, bot sẽ tự tải trực tiếp.
+- Với nội dung không công khai → thêm env `COOKIES_TXT` (Netscape cookies).
+

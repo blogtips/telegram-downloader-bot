@@ -1,4 +1,4 @@
-import asyncio, os, re, tempfile, shutil, pathlib, logging, sys, urllib.parse
+import asyncio, os, re, tempfile, shutil, pathlib, logging, sys, urllib.parse, json
 from aiohttp import web, ClientSession, ClientTimeout
 from telegram import Update
 from telegram.constants import ChatAction
@@ -30,17 +30,12 @@ FB_MOBILE_UA = ("Mozilla/5.0 (Linux; Android 10; SM-G973F) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36")
 FB_DESKTOP_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+FB_MBASIC_UA = ("Mozilla/5.0 (Linux; Android 9; Nexus 5) AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/99.0.4844.94 Mobile Safari/537.36")
 
-ASYNC_HEADERS_M = {
-    "User-Agent": FB_MOBILE_UA,
-    "Accept-Language": "en-US,en;q=0.9,vi;q=0.8",
-    "Referer": "https://m.facebook.com/",
-}
-ASYNC_HEADERS_W = {
-    "User-Agent": FB_DESKTOP_UA,
-    "Accept-Language": "en-US,en;q=0.9,vi;q=0.8",
-    "Referer": "https://www.facebook.com/",
-}
+HDR_M = {"User-Agent": FB_MOBILE_UA, "Accept-Language": "en-US,en;q=0.9,vi;q=0.8", "Referer": "https://m.facebook.com/"}
+HDR_W = {"User-Agent": FB_DESKTOP_UA, "Accept-Language": "en-US,en;q=0.9,vi;q=0.8", "Referer": "https://www.facebook.com/"}
+HDR_B = {"User-Agent": FB_MBASIC_UA, "Accept-Language": "en-US,en;q=0.9,vi;q=0.8", "Referer": "https://mbasic.facebook.com/"}
 
 # Optional cookies via env
 if os.environ.get("COOKIES_TXT"):
@@ -54,16 +49,14 @@ if os.environ.get("COOKIES_TXT"):
         log.warning("Failed to write cookies.txt from env: %s", e)
 
 def ua():
-    return os.environ.get(
-        "USER_AGENT",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36",
-    )
+    return os.environ.get("USER_AGENT",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36")
 
 def classify(url: str) -> str:
     u = url.lower()
     if any(d in u for d in ["douyin.com", "iesdouyin.com", "v.douyin.com"]): return "douyin"
     if any(d in u for d in ["tiktok.com", "vm.tiktok.com"]): return "tiktok"
-    if any(d in u for d in ["facebook.com", "fb.watch", "l.facebook.com", "m.facebook.com"]): return "facebook"
+    if any(d in u for d in ["facebook.com", "fb.watch", "l.facebook.com", "m.facebook.com", "mbasic.facebook.com"]): return "facebook"
     if "instagram.com" in u: return "instagram"
     return "unknown"
 
@@ -86,98 +79,136 @@ async def fetch(url: str, headers, return_text=False):
 def _join(base, path):
     return urllib.parse.urljoin(base, path)
 
-def _try_regexes(html, base_url, patterns):
+def _first_match(html, base, patterns):
     for rx in patterns:
         m = re.search(rx, html, re.I)
         if m:
-            return _join(base_url, urllib.parse.unquote(m.group(1)))
+            return _join(base, urllib.parse.unquote(m.group(1)))
     return None
 
-async def fb_extract_real_from_html(url: str) -> tuple[str|None, list]:
-    """Return (best_url, candidates) from share/r landing page HTML(s) on mobile + desktop."""
+def _swap_host(url: str, host: str) -> str:
+    p = urllib.parse.urlparse(url)
+    return urllib.parse.urlunparse(p._replace(netloc=host))
+
+async def fb_extract_candidates(url: str):
+    """Collect possible video URLs from different FB frontends: m, www, mbasic, and oEmbed."""
     candidates = []
-    for headers, host_note in ((ASYNC_HEADERS_M, "m"), (ASYNC_HEADERS_W, "www")):
+
+    # Try HTML from m. and www.
+    for headers in (HDR_M, HDR_W):
         try:
             html = await fetch(url, headers=headers, return_text=True)
         except Exception as e:
-            log.warning("fb_extract_real_from_html fetch failed (%s): %s", host_note, e)
+            log.warning("fb_extract_candidates fetch failed: %s", e)
             continue
 
-        # 1) Meta refresh
+        # meta refresh
         m = re.search(r'<meta[^>]+http-equiv=["\']refresh["\'][^>]+content=["\']\s*\d+\s*;\s*url=([^"\']+)["\']', html, re.I)
         if m:
-            u = _join(url, urllib.parse.unquote(m.group(1)))
-            candidates.append(u)
+            candidates.append(_join(url, urllib.parse.unquote(m.group(1))))
 
-        # 2) og:video*, og:url
+        # og:video*, og:url
         for prop in ("og:video:url","og:video:secure_url","og:video","og:url"):
             m = re.search(rf'<meta[^>]+property=["\']{re.escape(prop)}["\'][^>]+content=["\']([^"\']+)["\']', html, re.I)
             if m:
                 candidates.append(_join(url, m.group(1)))
 
-        # 3) anchors
-        anchor = _try_regexes(html, url, [
+        # anchors
+        a = _first_match(html, url, [
             r'href=["\'](/reel/[^"\']+)["\']',
             r'href=["\'](/watch/\?v=\d+)["\']',
             r'href=["\'](/video\.php\?[^"\']*v=\d+)[^"\']*["\']',
             r'href=["\'](/story\.php\?[^"\']*story_fbid=\d+[^"\']*)["\']',
         ])
-        if anchor: candidates.append(anchor)
+        if a: candidates.append(a)
 
-        # 4) video_id, reel_id patterns in inline JSON
+        # inline JSON ids
         m = re.search(r'{"video_id":"(\d+)"}', html)
-        if m:
-            candidates.append(f"https://m.facebook.com/watch/?v={m.group(1)}")
+        if m: candidates.append(f"https://m.facebook.com/watch/?v={m.group(1)}")
         m = re.search(r'"reel_id":"(\d+)"', html)
-        if m:
-            candidates.append(f"https://m.facebook.com/reel/{m.group(1)}")
+        if m: candidates.append(f"https://m.facebook.com/reel/{m.group(1)}")
 
-    # de-dup & prefer watch/reel
-    seen = set()
-    dedup = []
+    # Try mbasic front-end (often surfaces video_redirect)
+    try:
+        mbasic_url = _swap_host(url, "mbasic.facebook.com")
+        html_b = await fetch(mbasic_url, headers=HDR_B, return_text=True)
+        # direct video redirect (source file)
+        m = re.search(r'href=["\'](/video_redirect/\?src=[^"\']+)["\']', html_b, re.I)
+        if m:
+            candidates.append(_join(mbasic_url, m.group(1)))
+        # conventional anchors
+        a = _first_match(html_b, mbasic_url, [
+            r'href=["\'](/reel/[^"\']+)["\']',
+            r'href=["\'](/watch/\?v=\d+)["\']',
+            r'href=["\'](/video\.php\?[^"\']*v=\d+)[^"\']*["\']'
+        ])
+        if a: candidates.append(a)
+    except Exception as e:
+        log.warning("mbasic fetch failed: %s", e)
+
+    # oEmbed (public videos)
+    try:
+        enc = urllib.parse.quote(url, safe="")
+        oembed = f"https://www.facebook.com/plugins/video/oembed.json/?url={enc}"
+        async with ClientSession(timeout=ClientTimeout(total=10)) as s:
+            async with s.get(oembed, headers=HDR_W) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    html = data.get("html") or ""
+                    m = re.search(r'src=["\']([^"\']+plugins/video\.php\?href=[^"\']+)["\']', html)
+                    if m:
+                        candidates.append(urllib.parse.unquote(m.group(1)))
+    except Exception as e:
+        log.warning("oEmbed fetch failed: %s", e)
+
+    # dedup and preference
+    seen, dedup = set(), []
     for c in candidates:
         if not c: continue
         if c in seen: continue
         seen.add(c)
         dedup.append(c)
-    def score(u):
-        if "/watch/?" in u: return 0
-        if "/reel/" in u: return 1
-        if "/video.php" in u: return 2
-        if "/story.php" in u: return 3
-        return 4
-    dedup.sort(key=score)
-    return (dedup[0] if dedup else None, dedup)
 
-async def normalize_url(url: str, src: str) -> tuple[str, list]:
+    def score(u):
+        if "video_redirect/?src=" in u: return 0   # direct file
+        if "/watch/?" in u: return 1
+        if "/reel/" in u: return 2
+        if "/video.php" in u: return 3
+        if "/story.php" in u: return 4
+        if "plugins/video.php" in u: return 5
+        return 6
+    dedup.sort(key=score)
+    return dedup
+
+async def normalize_url(url: str, src: str):
     """Return (normalized_url, candidates)"""
     orig = url.strip()
     if not orig.startswith(("http://","https://")):
         orig = "https://" + orig
     url = strip_tracking_params(orig)
 
-    # follow redirects
+    # follow redirects with mobile and desktop headers
     try:
-        final_m = await fetch(url, headers=ASYNC_HEADERS_M, return_text=False)
+        final_m = await fetch(url, headers=HDR_M, return_text=False)
         if final_m: url = final_m
     except Exception as e:
-        log.warning("normalize_url mobile redirect failed for %s: %s", url, e)
+        log.warning("normalize mobile redirect failed: %s", e)
     try:
-        final_w = await fetch(url, headers=ASYNC_HEADERS_W, return_text=False)
+        final_w = await fetch(url, headers=HDR_W, return_text=False)
         if final_w: url = final_w
     except Exception as e:
-        log.warning("normalize_url desktop redirect failed for %s: %s", url, e)
+        log.warning("normalize desktop redirect failed: %s", e)
 
     candidates = []
-    if src == "facebook":
-        parsed = urllib.parse.urlparse(url)
-        host = parsed.netloc.lower()
-        if "facebook.com" in host and not host.startswith("m."):
-            url = urllib.parse.urlunparse(parsed._replace(netloc="m.facebook.com"))
-        if "/share/r/" in url or "/share/" in url:
-            best, cands = await fb_extract_real_from_html(url)
-            candidates = cands or []
-            if best: url = best
+    if src == "facebook" and ("/share/r/" in url or "/share/" in url or "facebook.com/share/" in url):
+        cands = await fb_extract_candidates(url)
+        candidates = cands
+        if cands:
+            url = cands[0]
+        # Normalize host to m. for yt-dlp where applicable
+        p = urllib.parse.urlparse(url)
+        if "facebook.com" in p.netloc and not p.netloc.startswith("m.") and "video_redirect" not in url:
+            url = urllib.parse.urlunparse(p._replace(netloc="m.facebook.com"))
     return url, candidates
 
 def extract_first_url(text: str) -> str | None:
@@ -232,7 +263,7 @@ async def trace_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     norm, cands = await normalize_url(url, src)
     msg = f"src={src}\noriginal={url}\nnormalized={norm}"
     if cands:
-        msg += "\ncandidates:\n" + "\n".join(f"- {c}" for c in cands[:6])
+        msg += "\ncandidates:\n" + "\n".join(f"- {c}" for c in cands[:10])
     await update.effective_chat.send_message(msg)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -269,11 +300,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.warning("normalize_url error: %s", e)
         norm_url, cands = url, []
 
-    # If still facebook share link or non-video page, suggest candidates
     if src == "facebook" and ("/share/r/" in norm_url or "/share/" in norm_url):
         msg = "Link share của Facebook chưa trỏ tới URL video cụ thể."
         if cands:
-            msg += "\nMình gợi ý các URL khả dĩ (hãy thử một trong các link sau):\n" + "\n".join(f"- {c}" for c in cands[:6])
+            msg += "\nMình gợi ý các URL khả dĩ (hãy thử một trong các link sau):\n" + "\n".join(f"- {c}" for c in cands[:10])
         msg += "\nHoặc dùng /trace <URL> để xem chi tiết."
         await chat.send_message(msg)
         return
@@ -300,6 +330,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "merge_output_format": "mp4",
         "extractor_args": {"facebook": {"app_id": ["0"]}},
     }
+    # If we resolved to video_redirect src, let yt-dlp handle direct URL; cookies often not required
     if cookies_path and pathlib.Path(cookies_path).exists():
         ydl_opts["cookiefile"] = cookies_path
 

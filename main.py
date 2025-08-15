@@ -1,19 +1,19 @@
-import asyncio, os, re, tempfile, shutil, pathlib, logging
+import asyncio, os, re, tempfile, shutil, pathlib, logging, sys
 from aiohttp import web
 from telegram import Update
 from telegram.constants import ChatAction
 from telegram.ext import Application, MessageHandler, CommandHandler, ContextTypes, filters
 import yt_dlp
 
-# --- Logging ---
 logging.basicConfig(
+    stream=sys.stdout,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     level=logging.INFO
 )
 log = logging.getLogger("bot")
 
 BOT_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-PORT = int(os.environ.get("PORT", "10000"))  # Render sets PORT for web services
+PORT = int(os.environ.get("PORT", "10000"))
 
 HELP_TEXT = (
     "Gửi link Douyin/TikTok/Facebook/Instagram.\n"
@@ -37,13 +37,13 @@ def classify(url: str) -> str:
     if "instagram.com" in u: return "instagram"
     return "unknown"
 
-async def start(update: Update, _: ContextTypes.DEFAULT_TYPE):
+async def start_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE):
     await update.effective_chat.send_message("Chào bạn!\n" + HELP_TEXT)
 
-async def ping(update: Update, _: ContextTypes.DEFAULT_TYPE):
+async def ping_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE):
     await update.effective_chat.send_message("pong ✅")
 
-async def debug(update: Update, _: ContextTypes.DEFAULT_TYPE):
+async def debug_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     text = msg.text or ""
     cap = msg.caption or ""
@@ -60,7 +60,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     msg = update.effective_message
 
-    # Prefer URL entities
     url = None
     if msg and msg.entities:
         for ent in msg.entities:
@@ -76,7 +75,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         url = extract_first_url((msg.text or "") + " " + (msg.caption or ""))
 
     if not url:
-        return  # ignore non-URL messages
+        return
 
     src = classify(url)
     log.info("Received URL from %s: %s (src=%s)", chat.id, url, src)
@@ -87,7 +86,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.warning("send_chat_action failed: %s", e)
 
     cookies_path = os.environ.get("YTDLP_COOKIES")
-
     ydl_opts = {
         "outtmpl": "%(title).200B.%(id)s.%(ext)s",
         "format": "mp4/best",
@@ -146,14 +144,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 async def run_polling():
+    if not BOT_TOKEN:
+        log.error("Missing TELEGRAM_TOKEN environment variable.")
+        return
+    log.info("BOT_TOKEN seems set (length=%d, masked).", len(BOT_TOKEN))
+
     app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("ping", ping))
-    app.add_handler(CommandHandler("debug", debug))
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("ping", ping_cmd))
+    app.add_handler(CommandHandler("debug", debug_cmd))
     app.add_handler(MessageHandler(filters.ALL & (~filters.COMMAND), handle_message))
 
     await app.initialize()
-    # IMPORTANT: ensure webhook is removed, otherwise polling won't receive updates
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
         log.info("Webhook deleted (if existed).")
@@ -162,20 +164,23 @@ async def run_polling():
 
     await app.start()
     log.info("Polling starting...")
-    await app.updater.start_polling(allowed_updates=None)  # default all types
+    await app.updater.start_polling(allowed_updates=None)
     log.info("Polling started and running.")
     await asyncio.Event().wait()
 
 def health_app():
-    async def ok(_): 
+    async def ok(_):
         return web.Response(text="ok")
     app = web.Application()
     app.router.add_get("/", ok)
+    app.router.add_get("/env", lambda req: web.json_response({
+        "has_token": bool(BOT_TOKEN),
+        "token_len": len(BOT_TOKEN) if BOT_TOKEN else 0
+    }))
     return app
 
 if __name__ == "__main__":
-    if not BOT_TOKEN:
-        raise SystemExit("Missing TELEGRAM_TOKEN")
+    log.info("Service booting, PORT=%s", PORT)
     loop = asyncio.get_event_loop()
     loop.create_task(run_polling())
     web.run_app(health_app(), port=PORT)

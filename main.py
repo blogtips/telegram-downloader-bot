@@ -1,4 +1,4 @@
-import asyncio, os, re, tempfile, shutil, pathlib, logging, sys, urllib.parse
+﻿import asyncio, os, re, tempfile, shutil, pathlib, logging, sys, urllib.parse
 from aiohttp import web, ClientSession, ClientTimeout
 from telegram import Update
 from telegram.constants import ChatAction
@@ -422,6 +422,14 @@ async def retry_telegram(call, what="tg-call", tries=8, base_delay=1.5):
             raise
         await asyncio.sleep(min(delay, 30))
     raise TimedOut(f"{what} timed out after retries")
+
+async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_chat.send_message(
+        f"entities={update.effective_message.entities}\n"
+        f"caption_entities={update.effective_message.caption_entities}\n"
+        f"text={update.effective_message.text}\n"
+        f"caption={update.effective_message.caption}"
+    )
 
 async def start_polling():
     if not BOT_TOKEN:

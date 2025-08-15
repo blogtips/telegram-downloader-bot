@@ -1,5 +1,8 @@
-# Telegram Downloader Bot — Render (v5.1)
+# Telegram Downloader Bot — Render (v5.2)
 
-Bổ sung resolver cho **Facebook `share/r`**: phân tích HTML (meta refresh, og:url, anchor `/reel/...`, `/watch/?v=...`, `video.php?v=...`) để lấy URL video gốc trước khi gọi `yt-dlp`. Giữ nguyên toàn bộ tính năng v5 (cookies qua `COOKIES_TXT`, retry Telegram, normalize các short links).
+V5.2 bổ sung:
+- Lệnh `/get <url>` (tải nhanh) và `/trace <url>` (trả về URL sau chuẩn hoá để bạn thấy kết quả resolver).
+- Resolver Facebook `share/r` mạnh hơn: đọc HTML để tìm `og:video`, `video_id`, anchors `/reel/`, `watch/?v=`, `video.php?v=...`.
+- Giữ nguyên các tính năng v5/5.1: cookies qua env `COOKIES_TXT`, retry Telegram, polling+web cùng event loop, normalize short links.
 
-Triển khai/Env/Test như v5.
+Triển khai như các bản trước.

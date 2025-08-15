@@ -1,4 +1,5 @@
-﻿import asyncio, os, re, tempfile, shutil, pathlib, logging, sys, urllib.parse
+
+import asyncio, os, re, tempfile, shutil, pathlib, logging, sys, urllib.parse, json, html as html_lib
 from aiohttp import web, ClientSession, ClientTimeout
 from telegram import Update
 from telegram.constants import ChatAction
@@ -21,7 +22,7 @@ HELP_TEXT = (
     "Gửi link Douyin/TikTok/Facebook/Instagram.\n"
     "- Video công khai tải trực tiếp; video riêng tư có thể cần cookies.\n"
     "- Tối đa ~2GB theo Bot API.\n\n"
-    "Lệnh: /ping, /debug, /get <url>, /trace <url>, /tracehtml <url>, /cookiecheck"
+    "Lệnh: /ping, /debug, /get <url>, /trace <url>, /cookiecheck"
 )
 
 URL_RE = re.compile(r"(https?://\S+)", re.IGNORECASE)
@@ -90,49 +91,80 @@ def _first_match(html, base, patterns):
             return _join(base, urllib.parse.unquote(m.group(1)))
     return None
 
+def _add(cands, base_url, val):
+    if not val: return
+    val = html_lib.unescape(val)
+    val = urllib.parse.urljoin(base_url, val)
+    if val not in cands:
+        cands.append(val)
+
 async def fb_collect_candidates(url: str):
     cands = []
+
     # m. and www.
     for hdr in (HDR_M, HDR_W):
         try:
             html = await fetch(url, headers=hdr, return_text=True)
         except Exception as e:
             log.warning("fb_collect_candidates fetch failed: %s", e)
-            continue
+            html = ""
+
         # meta refresh
-        m = re.search(r'<meta[^>]+http-equiv=["\']refresh["\'][^>]+content=["\']\s*\d+\s*;\s*url=([^"\']+)["\']', html, re.I)
-        if m: cands.append(_join(url, urllib.parse.unquote(m.group(1))))
+        m = re.search(r'<meta[^>]+http-equiv=[\'"]refresh[\'"][^>]+content=[\'"]\s*\d+\s*;\s*url=([^\'"]+)[\'"]', html, re.I)
+        if m: _add(cands, url, m.group(1))
+
         # og:video*, og:url
         for prop in ("og:video:url","og:video:secure_url","og:video","og:url"):
-            m = re.search(rf'<meta[^>]+property=["\']{re.escape(prop)}["\'][^>]+content=["\']([^"\']+)["\']', html, re.I)
-            if m: cands.append(_join(url, m.group(1)))
-        # anchors
-        a = _first_match(html, url, [
-            r'href=["\'](/reel/[^"\']+)["\']',
-            r'href=["\'](/watch/\?v=\d+)["\']',
-            r'href=["\'](/video\.php\?[^"\']*v=\d+)[^"\']*["\']',
-            r'href=["\'](/story\.php\?[^"\']*story_fbid=\d+[^"\']*)["\']',
-        ])
-        if a: cands.append(a)
-        # inline ids
+            m = re.search(rf'<meta[^>]+property=[\'"]{re.escape(prop)}[\'"][^>]+content=[\'"]([^\'"]+)[\'"]', html, re.I)
+            if m: _add(cands, url, m.group(1))
+
+        # anchors & l.php
+        for rx in [
+            r'href=[\'"](/reel/[^\'"]+)[\'"]',
+            r'href=[\'"](/watch/\?v=\d+)[\'"]',
+            r'href=[\'"](/video\.php\?[^\'"]*v=\d+)[^\'"]*[\'"]',
+            r'href=[\'"](/story\.php\?[^\'"]*story_fbid=\d+[^\'"]*)[\'"]',
+            r'href=[\'"](/l\.php\?u=[^\'"]+)[\'"]',
+        ]:
+            m = re.search(rx, html, re.I)
+            if m: _add(cands, url, m.group(1))
+
+        # data-lynx-uri
+        for m in re.finditer(r'data-lynx-uri=[\'"]([^\'"]+)[\'"]', html, re.I):
+            _add(cands, url, urllib.parse.unquote(m.group(1)))
+
+        # data-store JSON
+        for m in re.finditer(r'data-store=[\'"]([^\'"]+)[\'"]', html, re.I):
+            try:
+                j = html_lib.unescape(m.group(1))
+                d = json.loads(j)
+                href = d.get("href") or d.get("src") or d.get("finalUrl")
+                if href: _add(cands, url, href)
+            except Exception:
+                pass
+
+        # inline JSON ids
         m = re.search(r'{"video_id":"(\d+)"}', html)
-        if m: cands.append(f"https://m.facebook.com/watch/?v={m.group(1)}")
+        if m: _add(cands, url, f"https://m.facebook.com/watch/?v={m.group(1)}")
         m = re.search(r'"reel_id":"(\d+)"', html)
-        if m: cands.append(f"https://m.facebook.com/reel/{m.group(1)}")
-    # mbasic (often has video_redirect)
+        if m: _add(cands, url, f"https://m.facebook.com/reel/{m.group(1)}")
+
+    # mbasic
     try:
         mbasic = _swap_host(url, "mbasic.facebook.com")
         html_b = await fetch(mbasic, headers=HDR_B, return_text=True)
-        m = re.search(r'href=["\'](/video_redirect/\?src=[^"\']+)["\']', html_b, re.I)
-        if m: cands.append(_join(mbasic, m.group(1)))
-        a = _first_match(html_b, mbasic, [
-            r'href=["\'](/reel/[^"\']+)["\']',
-            r'href=["\'](/watch/\?v=\d+)["\']',
-            r'href=["\'](/video\.php\?[^"\']*v=\d+)[^"\']*["\']'
-        ])
-        if a: cands.append(a)
+        for m in re.finditer(r'href=[\'"](/video_redirect/\?src=[^\'"]+)[\'"]', html_b, re.I):
+            _add(cands, mbasic, m.group(1))
+        for rx in [
+            r'href=[\'"](/reel/[^\'"]+)[\'"]',
+            r'href=[\'"](/watch/\?v=\d+)[\'"]',
+            r'href=[\'"](/video\.php\?[^\'"]*v=\d+)[^\'"]*[\'"]'
+        ]:
+            m = re.search(rx, html_b, re.I)
+            if m: _add(cands, mbasic, m.group(1))
     except Exception as e:
         log.warning("mbasic fetch failed: %s", e)
+
     # oEmbed
     try:
         enc = urllib.parse.quote(url, safe="")
@@ -142,18 +174,18 @@ async def fb_collect_candidates(url: str):
                 if resp.status == 200:
                     data = await resp.json()
                     html = data.get("html") or ""
-                    m = re.search(r'src=["\']([^"\']+plugins/video\.php\?href=[^"\']+)["\']', html)
-                    if m:
-                        cands.append(urllib.parse.unquote(m.group(1)))
+                    m = re.search(r'src=[\'"]([^\'"]+plugins/video\.php\?href=[^\'"]+)[\'"]', html)
+                    if m: _add(cands, url, urllib.parse.unquote(m.group(1)))
     except Exception as e:
         log.warning("oEmbed fetch failed: %s", e)
 
-    # dedup & sort
+    # de-dup & sort
     seen, dedup = set(), []
     for c in cands:
         if c and c not in seen:
             seen.add(c)
             dedup.append(c)
+
     def score(u):
         if "video_redirect/?src=" in u: return 0
         if "/watch/?" in u: return 1
@@ -171,6 +203,7 @@ async def normalize_url(url: str, src: str):
         orig = "https://" + orig
     url = strip_tracking_params(orig)
 
+    # redirects
     try:
         final_m = await fetch(url, headers=HDR_M, return_text=False)
         if final_m: url = final_m
@@ -216,6 +249,14 @@ async def start_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE):
 async def ping_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE):
     await update.effective_chat.send_message("pong ✅")
 
+async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_chat.send_message(
+        f"entities={update.effective_message.entities}\n"
+        f"caption_entities={update.effective_message.caption_entities}\n"
+        f"text={update.effective_message.text}\n"
+        f"caption={update.effective_message.caption}"
+    )
+
 async def cookiecheck_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE):
     has = bool(os.environ.get("YTDLP_COOKIES")) and pathlib.Path(os.environ.get("YTDLP_COOKIES")).exists()
     await update.effective_chat.send_message(f"cookies_present={has} path={os.environ.get('YTDLP_COOKIES','')}")
@@ -233,10 +274,6 @@ async def trace_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if cands:
         msg += "\ncandidates:\n" + "\n".join(f"- {c}" for c in cands[:10])
     await update.effective_chat.send_message(msg)
-
-async def tracehtml_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # alias to /trace for now (we already parse HTML)
-    await trace_cmd(update, context)
 
 async def get_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.effective_message.text or "").strip()
@@ -279,7 +316,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.warning("normalize_url error: %s", e)
         norm_url, cands = url, []
 
-    # Special fast-path: mbasic video_redirect => direct mp4; download with aiohttp to improve success
+    # Fast-path: direct file via mbasic video_redirect
     if src == "facebook" and "video_redirect/?src=" in norm_url:
         try:
             await chat.send_message("🔎 Tìm thấy link file trực tiếp, đang tải...")
@@ -287,16 +324,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             async with ClientSession(timeout=timeout) as s:
                 async with s.get(norm_url, headers=HDR_B, allow_redirects=True) as resp:
                     resp.raise_for_status()
-                    # final url may be CDN mp4
-                    final_url = str(resp.url)
-                    # stream to temp file
                     fd, tmp_path = tempfile.mkstemp(suffix=".mp4")
                     with os.fdopen(fd, "wb") as out:
                         while True:
                             chunk = await resp.content.read(512 * 1024)
                             if not chunk: break
                             out.write(chunk)
-            # send video
             if pathlib.Path(tmp_path).stat().st_size > 2*1024*1024*1024:
                 await chat.send_message("File quá lớn (>2GB) nên không thể gửi qua Bot API.")
             else:
@@ -308,7 +341,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log.exception("direct mbasic download failed: %s", e)
             await chat.send_message(f"❌ Tải trực tiếp thất bại, sẽ thử yt-dlp. Lý do: {e}")
 
-    # If still share link unresolved
     if src == "facebook" and ("facebook.com/share/" in norm_url):
         msg = "Link share của Facebook chưa trỏ tới URL video cụ thể."
         if cands:
@@ -423,14 +455,6 @@ async def retry_telegram(call, what="tg-call", tries=8, base_delay=1.5):
         await asyncio.sleep(min(delay, 30))
     raise TimedOut(f"{what} timed out after retries")
 
-async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_chat.send_message(
-        f"entities={update.effective_message.entities}\n"
-        f"caption_entities={update.effective_message.caption_entities}\n"
-        f"text={update.effective_message.text}\n"
-        f"caption={update.effective_message.caption}"
-    )
-
 async def start_polling():
     if not BOT_TOKEN:
         log.error("Missing TELEGRAM_TOKEN environment variable.")
@@ -445,7 +469,6 @@ async def start_polling():
     app.add_handler(CommandHandler("debug", debug_cmd))
     app.add_handler(CommandHandler("cookiecheck", cookiecheck_cmd))
     app.add_handler(CommandHandler("trace", trace_cmd))
-    app.add_handler(CommandHandler("tracehtml", tracehtml_cmd))
     app.add_handler(CommandHandler("get", get_cmd))
     app.add_handler(MessageHandler(filters.ALL & (~filters.COMMAND), handle_message))
 
@@ -453,7 +476,6 @@ async def start_polling():
     async def _delwh(): return await app.bot.delete_webhook(drop_pending_updates=True)
     async def _start(): await app.start()
 
-    # retry around startup network calls
     for fn, name in ((_init, "app.initialize"), (_delwh, "delete_webhook"), (_start, "app.start")):
         try:
             await retry_telegram(fn, name)

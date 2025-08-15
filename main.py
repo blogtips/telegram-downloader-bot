@@ -34,6 +34,7 @@ ASYNC_REDIRECT_HEADERS = {
     "Referer": "https://m.facebook.com/",
 }
 
+# Optional cookies via env
 if os.environ.get("COOKIES_TXT"):
     try:
         path = "/app/cookies.txt"
@@ -61,16 +62,73 @@ def classify(url: str) -> str:
 def strip_tracking_params(url: str) -> str:
     parsed = urllib.parse.urlparse(url)
     qs = urllib.parse.parse_qs(parsed.query)
-    bad = {"mibextid","sfnsn","s","fbclid","gclid","utm_source","utm_medium","utm_campaign","utm_term","utm_content"}
+    bad = {"mibextid","sfnsn","s","fbclid","gclid","utm_source","utm_medium","utm_campaign","utm_term","utm_content","wtsid","refsrc"}
     qs = {k:v for k,v in qs.items() if k not in bad}
     new_q = urllib.parse.urlencode([(k,v2) for k,vals in qs.items() for v2 in vals])
     return urllib.parse.urlunparse(parsed._replace(query=new_q))
+
+async def fetch_text(url: str) -> str:
+    timeout = ClientTimeout(total=12)
+    async with ClientSession(timeout=timeout) as s:
+        async with s.get(url, allow_redirects=True, headers=ASYNC_REDIRECT_HEADERS) as resp:
+            return await resp.text()
+
+def _first(matchlist):
+    for m in matchlist:
+        if m: return m
+    return None
+
+def build_fb_url(path_or_url: str) -> str:
+    if path_or_url.startswith("http"):
+        return path_or_url
+    if path_or_url.startswith("/"):
+        return "https://m.facebook.com" + path_or_url
+    return "https://m.facebook.com/" + path_or_url
+
+async def fb_share_to_real(url: str) -> str:
+    """Resolve m.facebook.com/share/r/... to a real reel/watch/video URL by parsing HTML (meta refresh, og:url, anchors)."""
+    try:
+        html = await fetch_text(url)
+    except Exception as e:
+        log.warning("fb_share_to_real fetch failed: %s", e)
+        return url
+
+    # 1) Meta refresh
+    m = re.search(r'<meta[^>]+http-equiv=["\']refresh["\'][^>]+content=["\']\s*\d+\s*;\s*url=([^"\']+)["\']', html, re.I)
+    if m:
+        return build_fb_url(urllib.parse.unquote(m.group(1)))
+
+    # 2) og:url
+    m = re.search(r'<meta[^>]+property=["\']og:url["\'][^>]+content=["\']([^"\']+)["\']', html, re.I)
+    if m:
+        return build_fb_url(m.group(1))
+
+    # 3) Common anchors for reels/videos
+    for rx in [
+        r'href=["\'](/reel/[^"\']+)["\']',
+        r'href=["\'](/watch/\?v=\d+)["\']',
+        r'href=["\'](/video\.php\?[^"\']*v=\d+)[^"\']*["\']',
+        r'href=["\'](/story\.php\?[^"\']*story_fbid=\d+[^"\']*)["\']',
+    ]:
+        m = re.search(rx, html, re.I)
+        if m:
+            return build_fb_url(urllib.parse.unquote(m.group(1)))
+
+    # 4) l.php?u=... style
+    m = re.search(r'/l\.php\?u=([^"&]+)', html, re.I)
+    if m:
+        return urllib.parse.unquote(m.group(1))
+
+    # fallback unchanged
+    return url
 
 async def normalize_url(url: str, src: str) -> str:
     url = url.strip()
     if not url.startswith(("http://","https://")):
         url = "https://" + url
     url = strip_tracking_params(url)
+
+    # follow redirects for short/share links
     try:
         timeout = ClientTimeout(total=12)
         async with ClientSession(timeout=timeout) as s:
@@ -80,11 +138,21 @@ async def normalize_url(url: str, src: str) -> str:
                     url = final
     except Exception as e:
         log.warning("normalize_url redirect failed for %s: %s", url, e)
+
     if src == "facebook":
         parsed = urllib.parse.urlparse(url)
         host = parsed.netloc.lower()
         if "facebook.com" in host and not host.startswith("m."):
             url = urllib.parse.urlunparse(parsed._replace(netloc="m.facebook.com"))
+        # Special: share/r → try HTML parse to real video URL
+        if "/share/r/" in url:
+            try:
+                real = await fb_share_to_real(url)
+                if real and real != url:
+                    url = real
+            except Exception as e:
+                log.warning("fb_share_to_real failed: %s", e)
+
     return url
 
 def extract_first_url(text: str) -> str | None:
@@ -123,6 +191,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     msg = update.effective_message
 
+    # Extract URL
     url = None
     if msg and msg.entities:
         for ent in msg.entities:
@@ -142,6 +211,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     src = classify(url)
     log.info("Received URL from %s: %s (src=%s)", chat.id, url, src)
 
+    # Normalize/resolve
     try:
         url = await normalize_url(url, src)
         log.info("Normalized URL: %s", url)
@@ -210,24 +280,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except UnsupportedError as e:
         hint = ""
         if src == "facebook":
-            hint = ("\n👉 FB: Hãy copy **URL video/reel gốc** (vd `https://m.facebook.com/watch/?v=<ID>` "
-                    "hoặc `/reel/<ID>`). Nếu **không công khai**, cần **cookies**.")
+            hint = ("\n👉 FB: Link share/r đã được phân giải. "
+                    "Nếu vẫn Unsupported, có thể URL đích là nội dung **không công khai**/nhóm/tuổi."
+                    " Hãy dùng URL video gốc (vd `/reel/<ID>` hoặc `watch/?v=<ID>`) hoặc thêm **cookies**.")
         elif src == "tiktok":
-            hint = ("\n👉 TikTok: Dùng link `https://www.tiktok.com/@user/video/<id>` "
+            hint = ("\n👉 TikTok: Dùng `https://www.tiktok.com/@user/video/<id>` "
                     "(link `vm.tiktok.com` đã unshorten; nếu vẫn lỗi, copy link đầy đủ).")
         elif src == "douyin":
-            hint = ("\n👉 Douyin: Dùng `https://www.douyin.com/video/<id>` "
-                    "(nếu bị chặn vùng/quyền, cần cookies).")
+            hint = ("\n👉 Douyin: Dùng `https://www.douyin.com/video/<id>` (có thể bị chặn vùng).")
         elif src == "instagram":
             hint = ("\n👉 Instagram: Dùng `instagram.com/reel/<id>` hoặc `.../p/<id>`, "
-                    "bài phải công khai; nếu private → cần cookies.")
+                    "nội dung private cần cookies.")
         await chat.send_message(f"❌ Unsupported URL: {e}{hint}")
         log.exception("Unsupported URL: %s", e)
     except DownloadError as e:
         hint = ""
         if src == "facebook":
             hint = ("\n👉 FB: Nếu video **không công khai**, cần cookies. "
-                    "Đặt biến môi trường `COOKIES_TXT` trên Render; bot sẽ tự tạo `/app/cookies.txt`.")
+                    "Đặt biến `COOKIES_TXT` trên Render; bot sẽ tự tạo `/app/cookies.txt`.")
         await chat.send_message(f"❌ yt-dlp lỗi: {e}{hint}")
         log.exception("yt-dlp DownloadError: %s", e)
     except Exception as e:
@@ -264,14 +334,18 @@ async def start_polling():
     app.add_handler(CommandHandler("debug", debug_cmd))
     app.add_handler(MessageHandler(filters.ALL & (~filters.COMMAND), handle_message))
 
-    await retry_telegram(lambda: app.initialize(), "app.initialize")
+    async def _init(): await app.initialize()
+    async def _delwh(): return await app.bot.delete_webhook(drop_pending_updates=True)
+    async def _start(): await app.start()
+
+    await retry_telegram(_init, "app.initialize")
     try:
-        await retry_telegram(lambda: app.bot.delete_webhook(drop_pending_updates=True), "delete_webhook")
+        await retry_telegram(_delwh, "delete_webhook")
         log.info("Webhook deleted (if existed).")
     except Exception as e:
         log.warning("delete_webhook failed (continue): %s", e)
+    await retry_telegram(_start, "app.start")
 
-    await retry_telegram(lambda: app.start(), "app.start")
     log.info("Polling starting...")
     try:
         await app.updater.start_polling(allowed_updates=None, timeout=60, poll_interval=0.8)

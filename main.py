@@ -5,6 +5,7 @@ from telegram.constants import ChatAction
 from telegram.ext import Application, MessageHandler, CommandHandler, ContextTypes, filters
 import yt_dlp
 
+# --- Logging ---
 logging.basicConfig(
     stream=sys.stdout,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -143,7 +144,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         os.chdir(cwd)
         shutil.rmtree(tmpdir, ignore_errors=True)
 
-async def run_polling():
+async def start_web_app():
+    app = web.Application()
+    async def ok(_): return web.Response(text="ok")
+    async def env(_): 
+        return web.json_response({
+            "has_token": bool(BOT_TOKEN),
+            "token_len": len(BOT_TOKEN) if BOT_TOKEN else 0
+        })
+    app.router.add_get("/", ok)
+    app.router.add_get("/env", env)
+
+    runner = web.AppRunner(app, access_log=logging.getLogger("aiohttp.access"))
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
+    await site.start()
+    log.info("HTTP server started on 0.0.0.0:%s", PORT)
+
+async def start_polling():
     if not BOT_TOKEN:
         log.error("Missing TELEGRAM_TOKEN environment variable.")
         return
@@ -166,21 +184,19 @@ async def run_polling():
     log.info("Polling starting...")
     await app.updater.start_polling(allowed_updates=None)
     log.info("Polling started and running.")
+
+    # keep it alive
     await asyncio.Event().wait()
 
-def health_app():
-    async def ok(_):
-        return web.Response(text="ok")
-    app = web.Application()
-    app.router.add_get("/", ok)
-    app.router.add_get("/env", lambda req: web.json_response({
-        "has_token": bool(BOT_TOKEN),
-        "token_len": len(BOT_TOKEN) if BOT_TOKEN else 0
-    }))
-    return app
+async def main():
+    log.info("Service booting, PORT=%s", PORT)
+    await asyncio.gather(
+        start_web_app(),
+        start_polling()
+    )
 
 if __name__ == "__main__":
-    log.info("Service booting, PORT=%s", PORT)
-    loop = asyncio.get_event_loop()
-    loop.create_task(run_polling())
-    web.run_app(health_app(), port=PORT)
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass

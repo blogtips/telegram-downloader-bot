@@ -1,15 +1,42 @@
-# Telegram Downloader Bot (Render.com) — v2
+# Telegram Downloader Bot — Render.com (v5)
 
-Cải tiến:
-- Bắt link từ `entities`/`caption_entities` (URL & TEXT_LINK), regex fallback.
-- Dùng `ChatAction.UPLOAD_VIDEO` đúng chuẩn PTB v21.
-- Logging chi tiết để xem trong Render Logs.
-- Hoạt động cả DM và group (lưu ý Privacy Mode).
+Bot Telegram nhận link Douyin/TikTok/Facebook/Instagram và gửi lại video (cố gắng không watermark) bằng `yt-dlp`.
 
-## Gợi ý nếu bot không phản hồi
-1. **Kiểm tra Logs** (Render → Service → Logs). Bạn sẽ thấy dòng `Received URL ...` khi bot nhận tin.
-2. **Bật chat riêng & gửi `/start`** trước khi gửi link (bắt buộc cho lần đầu).
-3. **Group**: nếu dùng trong nhóm, @BotFather `/setprivacy` → **Disable** để bot đọc tin nhắn thường.
-4. **Chỉ 1 instance** chạy polling (Scale=1). Nếu >1 sẽ conflict.
-5. **TELEGRAM_TOKEN** phải đúng.
-6. **Link phải đầy đủ `http(s)://...`** (regex & entity đã hỗ trợ hầu hết trường hợp).
+**Điểm nổi bật v5**
+- Web server + polling chạy song song (không block event loop)
+- Chuẩn hoá URL: unshorten `share/r`, `vm.tiktok.com`, `v.douyin.com`, `l.facebook.com`...
+- Mobile UA/Referer cho Facebook, auto chuyển sang `m.facebook.com`
+- Retry Telegram API khi khởi động (tránh deploy fail do timeout)
+- Hỗ trợ cookies qua env `COOKIES_TXT` (không cần commit file)
+- Lệnh `/start`, `/ping`, `/debug`
+
+## Deploy trên Render
+1. Push repo này lên GitHub.
+2. Render → New → Web Service → Runtime **Docker**.
+3. Env:
+   - `TELEGRAM_TOKEN` (bắt buộc)
+   - `COOKIES_TXT` (tùy chọn) – dán nội dung cookies.txt, bot sẽ tạo `/app/cookies.txt` và dùng.
+   - `USER_AGENT` (tùy chọn).
+4. Manual Deploy.
+5. Logs cần thấy:
+   - `HTTP server started on 0.0.0.0:10000`
+   - `Webhook deleted (if existed).`
+   - `Polling starting...` → `Polling started and running.`
+
+## Test
+- DM `/ping` → `pong ✅`
+- Gửi link video TT/DY/FB/IG.
+- FB/IG không công khai → cần `COOKIES_TXT`.
+
+## Local
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+export TELEGRAM_TOKEN=xxxx:yyyy
+python main.py
+```
+
+**Lưu ý**
+- Bot API ~2GB/file.
+- Dùng group: tắt Privacy Mode qua @BotFather `/setprivacy`.
+- Lỗi `Conflict getUpdates`: chỉ chạy **1 instance** cho mỗi token.

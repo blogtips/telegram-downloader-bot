@@ -1,4 +1,4 @@
-import asyncio, os, re, tempfile, shutil, pathlib, logging, sys, urllib.parse, json
+import asyncio, os, re, tempfile, shutil, pathlib, logging, sys, urllib.parse
 from aiohttp import web, ClientSession, ClientTimeout
 from telegram import Update
 from telegram.constants import ChatAction
@@ -28,11 +28,18 @@ URL_RE = re.compile(r"(https?://\S+)", re.IGNORECASE)
 
 FB_MOBILE_UA = ("Mozilla/5.0 (Linux; Android 10; SM-G973F) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36")
+FB_DESKTOP_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                 "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 
-ASYNC_REDIRECT_HEADERS = {
+ASYNC_HEADERS_M = {
     "User-Agent": FB_MOBILE_UA,
     "Accept-Language": "en-US,en;q=0.9,vi;q=0.8",
     "Referer": "https://m.facebook.com/",
+}
+ASYNC_HEADERS_W = {
+    "User-Agent": FB_DESKTOP_UA,
+    "Accept-Language": "en-US,en;q=0.9,vi;q=0.8",
+    "Referer": "https://www.facebook.com/",
 }
 
 # Optional cookies via env
@@ -68,77 +75,110 @@ def strip_tracking_params(url: str) -> str:
     new_q = urllib.parse.urlencode([(k,v2) for k,vals in qs.items() for v2 in vals])
     return urllib.parse.urlunparse(parsed._replace(query=new_q))
 
-async def fetch(url: str, return_text=False):
+async def fetch(url: str, headers, return_text=False):
     timeout = ClientTimeout(total=15)
     async with ClientSession(timeout=timeout) as s:
-        async with s.get(url, allow_redirects=True, headers=ASYNC_REDIRECT_HEADERS) as resp:
+        async with s.get(url, allow_redirects=True, headers=headers) as resp:
             if return_text:
                 return await resp.text()
             return str(resp.url)
 
-async def fb_extract_real_from_html(url: str) -> str | None:
-    """Try hard to find a concrete video URL from share/r landing page HTML."""
-    try:
-        html = await fetch(url, return_text=True)
-    except Exception as e:
-        log.warning("fb_extract_real_from_html fetch failed: %s", e)
-        return None
+def _join(base, path):
+    return urllib.parse.urljoin(base, path)
 
-    # 1) Meta refresh
-    m = re.search(r'<meta[^>]+http-equiv=["\']refresh["\'][^>]+content=["\']\s*\d+\s*;\s*url=([^"\']+)["\']', html, re.I)
-    if m:
-        return urllib.parse.urljoin(url, urllib.parse.unquote(m.group(1)))
-
-    # 2) og:video / og:url
-    for prop in ("og:video:url","og:video:secure_url","og:video","og:url"):
-        m = re.search(rf'<meta[^>]+property=["\']{re.escape(prop)}["\'][^>]+content=["\']([^"\']+)["\']', html, re.I)
-        if m:
-            return urllib.parse.urljoin(url, m.group(1))
-
-    # 3) Anchors to reel/watch/video.php/story.php
-    for rx in [
-        r'href=["\'](/reel/[^"\']+)["\']',
-        r'href=["\'](/watch/\?v=\d+)["\']',
-        r'href=["\'](/video\.php\?[^"\']*v=\d+)[^"\']*["\']',
-        r'href=["\'](/story\.php\?[^"\']*story_fbid=\d+[^"\']*)["\']',
-    ]:
+def _try_regexes(html, base_url, patterns):
+    for rx in patterns:
         m = re.search(rx, html, re.I)
         if m:
-            return urllib.parse.urljoin(url, urllib.parse.unquote(m.group(1)))
-
-    # 4) Look for JSON with video_id
-    for m in re.finditer(r'{"video_id":"(\d+)"', html):
-        vid = m.group(1)
-        return f"https://m.facebook.com/watch/?v={vid}"
-
+            return _join(base_url, urllib.parse.unquote(m.group(1)))
     return None
 
-async def normalize_url(url: str, src: str) -> str:
-    url = url.strip()
-    if not url.startswith(("http://","https://")):
-        url = "https://" + url
-    url = strip_tracking_params(url)
+async def fb_extract_real_from_html(url: str) -> tuple[str|None, list]:
+    """Return (best_url, candidates) from share/r landing page HTML(s) on mobile + desktop."""
+    candidates = []
+    for headers, host_note in ((ASYNC_HEADERS_M, "m"), (ASYNC_HEADERS_W, "www")):
+        try:
+            html = await fetch(url, headers=headers, return_text=True)
+        except Exception as e:
+            log.warning("fb_extract_real_from_html fetch failed (%s): %s", host_note, e)
+            continue
 
-    # Follow redirects for short/share links
+        # 1) Meta refresh
+        m = re.search(r'<meta[^>]+http-equiv=["\']refresh["\'][^>]+content=["\']\s*\d+\s*;\s*url=([^"\']+)["\']', html, re.I)
+        if m:
+            u = _join(url, urllib.parse.unquote(m.group(1)))
+            candidates.append(u)
+
+        # 2) og:video*, og:url
+        for prop in ("og:video:url","og:video:secure_url","og:video","og:url"):
+            m = re.search(rf'<meta[^>]+property=["\']{re.escape(prop)}["\'][^>]+content=["\']([^"\']+)["\']', html, re.I)
+            if m:
+                candidates.append(_join(url, m.group(1)))
+
+        # 3) anchors
+        anchor = _try_regexes(html, url, [
+            r'href=["\'](/reel/[^"\']+)["\']',
+            r'href=["\'](/watch/\?v=\d+)["\']',
+            r'href=["\'](/video\.php\?[^"\']*v=\d+)[^"\']*["\']',
+            r'href=["\'](/story\.php\?[^"\']*story_fbid=\d+[^"\']*)["\']',
+        ])
+        if anchor: candidates.append(anchor)
+
+        # 4) video_id, reel_id patterns in inline JSON
+        m = re.search(r'{"video_id":"(\d+)"}', html)
+        if m:
+            candidates.append(f"https://m.facebook.com/watch/?v={m.group(1)}")
+        m = re.search(r'"reel_id":"(\d+)"', html)
+        if m:
+            candidates.append(f"https://m.facebook.com/reel/{m.group(1)}")
+
+    # de-dup & prefer watch/reel
+    seen = set()
+    dedup = []
+    for c in candidates:
+        if not c: continue
+        if c in seen: continue
+        seen.add(c)
+        dedup.append(c)
+    def score(u):
+        if "/watch/?" in u: return 0
+        if "/reel/" in u: return 1
+        if "/video.php" in u: return 2
+        if "/story.php" in u: return 3
+        return 4
+    dedup.sort(key=score)
+    return (dedup[0] if dedup else None, dedup)
+
+async def normalize_url(url: str, src: str) -> tuple[str, list]:
+    """Return (normalized_url, candidates)"""
+    orig = url.strip()
+    if not orig.startswith(("http://","https://")):
+        orig = "https://" + orig
+    url = strip_tracking_params(orig)
+
+    # follow redirects
     try:
-        final = await fetch(url, return_text=False)
-        if final:
-            url = final
+        final_m = await fetch(url, headers=ASYNC_HEADERS_M, return_text=False)
+        if final_m: url = final_m
     except Exception as e:
-        log.warning("normalize_url redirect failed for %s: %s", url, e)
+        log.warning("normalize_url mobile redirect failed for %s: %s", url, e)
+    try:
+        final_w = await fetch(url, headers=ASYNC_HEADERS_W, return_text=False)
+        if final_w: url = final_w
+    except Exception as e:
+        log.warning("normalize_url desktop redirect failed for %s: %s", url, e)
 
-    # Facebook-specific tweaks
+    candidates = []
     if src == "facebook":
         parsed = urllib.parse.urlparse(url)
         host = parsed.netloc.lower()
         if "facebook.com" in host and not host.startswith("m."):
             url = urllib.parse.urlunparse(parsed._replace(netloc="m.facebook.com"))
-        # If still share/r or a non-concrete path, parse HTML for real video URL
         if "/share/r/" in url or "/share/" in url:
-            real = await fb_extract_real_from_html(url)
-            if real:
-                url = real
-    return url
+            best, cands = await fb_extract_real_from_html(url)
+            candidates = cands or []
+            if best: url = best
+    return url, candidates
 
 def extract_first_url(text: str) -> str | None:
     if not text: return None
@@ -189,8 +229,11 @@ async def trace_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     url = parts[1]
     src = classify(url)
-    norm = await normalize_url(url, src)
-    await update.effective_chat.send_message(f"src={src}\noriginal={url}\nnormalized={norm}")
+    norm, cands = await normalize_url(url, src)
+    msg = f"src={src}\noriginal={url}\nnormalized={norm}"
+    if cands:
+        msg += "\ncandidates:\n" + "\n".join(f"- {c}" for c in cands[:6])
+    await update.effective_chat.send_message(msg)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
@@ -219,15 +262,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Normalize/resolve
     try:
-        norm_url = await normalize_url(url, src)
+        norm_url, cands = await normalize_url(url, src)
         log.info("Normalized URL: %s", norm_url)
+        if cands: log.info("Candidates: %s", cands)
     except Exception as e:
         log.warning("normalize_url error: %s", e)
-        norm_url = url
+        norm_url, cands = url, []
 
-    # If still facebook share link, inform user
+    # If still facebook share link or non-video page, suggest candidates
     if src == "facebook" and ("/share/r/" in norm_url or "/share/" in norm_url):
-        await chat.send_message("Link share của Facebook chưa trỏ tới URL video cụ thể. Hãy dùng /trace <URL> để xem URL sau khi chuẩn hoá, hoặc mở video và copy link dạng `/reel/<ID>` hay `watch/?v=<ID>`.")
+        msg = "Link share của Facebook chưa trỏ tới URL video cụ thể."
+        if cands:
+            msg += "\nMình gợi ý các URL khả dĩ (hãy thử một trong các link sau):\n" + "\n".join(f"- {c}" for c in cands[:6])
+        msg += "\nHoặc dùng /trace <URL> để xem chi tiết."
+        await chat.send_message(msg)
         return
 
     try:
@@ -292,8 +340,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except UnsupportedError as e:
         hint = ""
         if src == "facebook":
-            hint = ("\n👉 FB: Link share đã được xử lý. Nếu vẫn unsupported, có thể đây không phải trang video (ví dụ ảnh/bài viết), "
-                    "hoặc cần cookies. Dùng /trace <URL> để xem link sau chuẩn hoá.")
+            hint = ("\n👉 FB: Nếu vẫn unsupported, có thể link share không dẫn tới trang video (ảnh/bài viết). "
+                    "Dùng /trace để xem candidates, hoặc mở video và copy trực tiếp URL `/reel/<ID>` / `watch/?v=<ID>`.")
         await chat.send_message(f"❌ Unsupported URL: {e}{hint}")
         log.exception("Unsupported URL: %s", e)
     except DownloadError as e:

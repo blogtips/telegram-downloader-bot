@@ -1,10 +1,10 @@
-# Telegram Video Downloader Bot
+﻿# Telegram Video Downloader Bot
 
 Bot tải video từ TikTok, Douyin, Facebook, Instagram.
 
 ## Cách deploy trên Render
 
-1. Fork repo này.
+1. Clone repo này hoặc copy code.
 2. Tạo service mới trên [Render.com](https://render.com).
 3. Chọn **Background Worker**.
 4. Add biến môi trường:

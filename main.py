@@ -1,4 +1,4 @@
-import os
+﻿import os
 import yt_dlp
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import FSInputFile

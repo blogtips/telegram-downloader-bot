@@ -1,19 +1,20 @@
 
-# Telegram Downloader Bot — Render (v5.6)
+# Telegram Downloader Bot — Render (v5.7)
 
-## Điểm mới
-- Resolver Facebook `share/r` mạnh nhất: unescape `&amp;`, quét `data-lynx-uri`, `data-store` (JSON), `og:video*`, `l.php`, thử cả `mbasic`/`oEmbed`.
-- Nếu phát hiện `mbasic.facebook.com/video_redirect/?src=...` → **tải trực tiếp** (không qua yt-dlp).
-- Lệnh: `/get <url>`, `/trace <url>`, `/cookiecheck`, `/debug`.
-- Giữ: cookies qua `COOKIES_TXT`, retry khi khởi động, web+polling song song.
+Tập trung **khắc phục Facebook share/r** và case l.php.
 
-## Triển khai nhanh (Render/Docker)
-1) Push code lên GitHub (giữ `Dockerfile` ở root).
+## Điểm chính
+- Bóc `share/r` qua `m.` / `www.` / `mbasic` / `oEmbed`, ưu tiên:
+  - `mbasic.facebook.com/video_redirect/?src=...` (file trực tiếp)
+  - `watch/?v=...`, `reel/...`, `video.php?...`, `plugins/video.php?href=...`
+- Unwrap `l.php?u=...` (Facebook forwarder).
+- **Fast-path tải trực tiếp** nếu thấy `video_redirect/?src=...` (không qua yt-dlp).
+- Lệnh debug: `/trace`, `/tracejson`, `/cookiecheck`, `/debug`.
+
+## Triển khai
+1) Đưa code lên Git + giữ `Dockerfile` ở root.
 2) Render → New → Web Service → Runtime Docker.
-3) Env: `TELEGRAM_TOKEN` (bắt buộc), (tuỳ chọn) `COOKIES_TXT` nếu cần xem nội dung không công khai.
-4) Deploy → Logs cần thấy: `HTTP server started...` và `Polling started and running.`
-
-## Kiểm tra
-- `/ping` → `pong ✅`
-- `/trace <link_share>` → xem `normalized` + `candidates`.
-- Nếu có candidate `video_redirect/?src=...` → `/get <candidate>` hoặc gửi lại link share để bot tự tải trực tiếp.
+3) ENV: `TELEGRAM_TOKEN` (bắt buộc), `COOKIES_TXT` (tuỳ chọn).
+4) Logs cần thấy:
+   - `HTTP server started on 0.0.0.0:10000`
+   - `Polling started and running.`

@@ -8,11 +8,7 @@ from telegram.error import TimedOut, NetworkError, RetryAfter
 import yt_dlp
 from yt_dlp.utils import DownloadError, UnsupportedError
 
-logging.basicConfig(
-    stream=sys.stdout,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    level=logging.INFO
-)
+logging.basicConfig(stream=sys.stdout, format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 log = logging.getLogger("bot")
 
 BOT_TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -22,23 +18,20 @@ HELP_TEXT = (
     "Gửi link Douyin/TikTok/Facebook/Instagram.\n"
     "- Video công khai tải trực tiếp; video riêng tư có thể cần cookies.\n"
     "- Tối đa ~2GB theo Bot API.\n\n"
-    "Lệnh: /ping, /debug, /get <url>, /trace <url>, /cookiecheck"
+    "Lệnh: /ping, /debug, /get <url>, /trace <url>, /tracejson <url>, /cookiecheck"
 )
 
 URL_RE = re.compile(r"(https?://\S+)", re.IGNORECASE)
 
-UA_FB_M = ("Mozilla/5.0 (Linux; Android 10; SM-G973F) AppleWebKit/537.36 "
-           "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36")
-UA_FB_W = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-           "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-UA_FB_B = ("Mozilla/5.0 (Linux; Android 9; Nexus 5) AppleWebKit/537.36 "
-           "(KHTML, like Gecko) Chrome/99.0.4844.94 Mobile Safari/537.36")
+UA_FB_M = ("Mozilla/5.0 (Linux; Android 10; SM-G973F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36")
+UA_FB_W = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+UA_FB_B = ("Mozilla/5.0 (Linux; Android 9; Nexus 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/99.0.4844.94 Mobile Safari/537.36")
 
 HDR_M = {"User-Agent": UA_FB_M, "Accept-Language": "en-US,en;q=0.9,vi;q=0.8", "Referer": "https://m.facebook.com/"}
 HDR_W = {"User-Agent": UA_FB_W, "Accept-Language": "en-US,en;q=0.9,vi;q=0.8", "Referer": "https://www.facebook.com/"}
 HDR_B = {"User-Agent": UA_FB_B, "Accept-Language": "en-US,en;q=0.9,vi;q=0.8", "Referer": "https://mbasic.facebook.com/"}
 
-# Cookies from env (optional)
+# Cookies
 if os.environ.get("COOKIES_TXT"):
     try:
         path = "/app/cookies.txt"
@@ -48,10 +41,6 @@ if os.environ.get("COOKIES_TXT"):
         log.info("cookies.txt created from COOKIES_TXT env, length=%d", len(os.environ["COOKIES_TXT"]))
     except Exception as e:
         log.warning("Failed to write cookies.txt from env: %s", e)
-
-def ua_default():
-    return os.environ.get("USER_AGENT",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36")
 
 def classify(url: str) -> str:
     u = url.lower()
@@ -64,12 +53,12 @@ def classify(url: str) -> str:
 def strip_tracking_params(url: str) -> str:
     parsed = urllib.parse.urlparse(url)
     qs = urllib.parse.parse_qs(parsed.query)
-    bad = {"mibextid","sfnsn","s","fbclid","gclid","utm_source","utm_medium","utm_campaign","utm_term","utm_content","wtsid","refsrc"}
+    bad = {"mibextid","sfnsn","s","fbclid","gclid","utm_source","utm_medium","utm_campaign","utm_term","utm_content","wtsid","refsrc","_rdr"}
     qs = {k:v for k,v in qs.items() if k not in bad}
     new_q = urllib.parse.urlencode([(k,v2) for k,vals in qs.items() for v2 in vals])
     return urllib.parse.urlunparse(parsed._replace(query=new_q))
 
-async def fetch(url: str, headers, return_text=False):
+async def http_get(url: str, headers, return_text=False):
     timeout = ClientTimeout(total=15)
     async with ClientSession(timeout=timeout) as s:
         async with s.get(url, allow_redirects=True, headers=headers) as resp:
@@ -77,95 +66,92 @@ async def fetch(url: str, headers, return_text=False):
                 return await resp.text()
             return str(resp.url)
 
-def _join(base, path):
-    return urllib.parse.urljoin(base, path)
-
 def _swap_host(url: str, host: str) -> str:
     p = urllib.parse.urlparse(url)
     return urllib.parse.urlunparse(p._replace(netloc=host))
 
-def _first_match(html, base, patterns):
-    for rx in patterns:
-        m = re.search(rx, html, re.I)
-        if m:
-            return _join(base, urllib.parse.unquote(m.group(1)))
-    return None
-
-def _add(cands, base_url, val):
+def _add(cands, base_url, val, why):
     if not val: return
     val = html_lib.unescape(val)
     val = urllib.parse.urljoin(base_url, val)
-    if val not in cands:
-        cands.append(val)
+    if val not in [c["url"] for c in cands]:
+        cands.append({"url": val, "why": why})
+
+def _unwrap_lphp(url: str) -> str:
+    # facebook l.php?u=<encoded target>
+    p = urllib.parse.urlparse(url)
+    if p.path.endswith("/l.php"):
+        q = urllib.parse.parse_qs(p.query)
+        u = q.get("u", [None])[0]
+        if u:
+            return urllib.parse.unquote(u)
+    return url
 
 async def fb_collect_candidates(url: str):
     cands = []
+    # 1) Unwrap l.php early
+    unwrapped = _unwrap_lphp(url)
+    if unwrapped != url:
+        _add(cands, url, unwrapped, "l.php unwrap")
+        url = unwrapped
 
-    # m. and www.
-    for hdr in (HDR_M, HDR_W):
+    # 2) m. and www.
+    for hdr, tag in ((HDR_M, "m.html"), (HDR_W, "www.html")):
         try:
-            html = await fetch(url, headers=hdr, return_text=True)
+            html = await http_get(url, headers=hdr, return_text=True)
         except Exception as e:
-            log.warning("fb_collect_candidates fetch failed: %s", e)
-            html = ""
+            log.warning("fb_collect fetch failed: %s", e); html = ""
 
-        # meta refresh
         m = re.search(r'<meta[^>]+http-equiv=[\'"]refresh[\'"][^>]+content=[\'"]\s*\d+\s*;\s*url=([^\'"]+)[\'"]', html, re.I)
-        if m: _add(cands, url, m.group(1))
+        if m: _add(cands, url, m.group(1), f"{tag} meta refresh")
 
-        # og:video*, og:url
         for prop in ("og:video:url","og:video:secure_url","og:video","og:url"):
             m = re.search(rf'<meta[^>]+property=[\'"]{re.escape(prop)}[\'"][^>]+content=[\'"]([^\'"]+)[\'"]', html, re.I)
-            if m: _add(cands, url, m.group(1))
+            if m: _add(cands, url, m.group(1), f"{tag} {prop}")
 
-        # anchors & l.php
-        for rx in [
-            r'href=[\'"](/reel/[^\'"]+)[\'"]',
-            r'href=[\'"](/watch/\?v=\d+)[\'"]',
-            r'href=[\'"](/video\.php\?[^\'"]*v=\d+)[^\'"]*[\'"]',
-            r'href=[\'"](/story\.php\?[^\'"]*story_fbid=\d+[^\'"]*)[\'"]',
-            r'href=[\'"](/l\.php\?u=[^\'"]+)[\'"]',
+        for rx, why in [
+            (r'href=[\'"](/reel/[^\'"]+)[\'"]', f"{tag} reel"),
+            (r'href=[\'"](/watch/\?v=\d+)[\'"]', f"{tag} watch"),
+            (r'href=[\'"](/video\.php\?[^\'"]*v=\d+)[^\'"]*[\'"]', f"{tag} video.php"),
+            (r'href=[\'"](/story\.php\?[^\'"]*story_fbid=\d+[^\'"]*)[\'"]', f"{tag} story"),
+            (r'href=[\'"](/l\.php\?u=[^\'"]+)[\'"]', f"{tag} l.php"),
         ]:
             m = re.search(rx, html, re.I)
-            if m: _add(cands, url, m.group(1))
+            if m: _add(cands, url, m.group(1), why)
 
-        # data-lynx-uri
-        for m in re.finditer(r'data-lynx-uri=[\'"]([^\'"]+)[\'"]', html, re.I):
-            _add(cands, url, urllib.parse.unquote(m.group(1)))
+        for m_ in re.finditer(r'data-lynx-uri=[\'"]([^\'"]+)[\'"]', html, re.I):
+            _add(cands, url, urllib.parse.unquote(m_.group(1)), f"{tag} data-lynx-uri")
 
-        # data-store JSON
-        for m in re.finditer(r'data-store=[\'"]([^\'"]+)[\'"]', html, re.I):
+        for m_ in re.finditer(r'data-store=[\'"]([^\'"]+)[\'"]', html, re.I):
             try:
-                j = html_lib.unescape(m.group(1))
+                j = html_lib.unescape(m_.group(1))
                 d = json.loads(j)
                 href = d.get("href") or d.get("src") or d.get("finalUrl")
-                if href: _add(cands, url, href)
-            except Exception:
-                pass
+                if href: _add(cands, url, href, f"{tag} data-store")
+            except Exception: pass
 
-        # inline JSON ids
         m = re.search(r'{"video_id":"(\d+)"}', html)
-        if m: _add(cands, url, f"https://m.facebook.com/watch/?v={m.group(1)}")
+        if m: _add(cands, url, f"https://m.facebook.com/watch/?v={m.group(1)}", f"{tag} inline video_id")
         m = re.search(r'"reel_id":"(\d+)"', html)
-        if m: _add(cands, url, f"https://m.facebook.com/reel/{m.group(1)}")
+        if m: _add(cands, url, f"https://m.facebook.com/reel/{m.group(1)}", f"{tag} inline reel_id")
 
-    # mbasic
+    # 3) mbasic
     try:
         mbasic = _swap_host(url, "mbasic.facebook.com")
-        html_b = await fetch(mbasic, headers=HDR_B, return_text=True)
+        html_b = await http_get(mbasic, headers=HDR_B, return_text=True)
         for m in re.finditer(r'href=[\'"](/video_redirect/\?src=[^\'"]+)[\'"]', html_b, re.I):
-            _add(cands, mbasic, m.group(1))
-        for rx in [
-            r'href=[\'"](/reel/[^\'"]+)[\'"]',
-            r'href=[\'"](/watch/\?v=\d+)[\'"]',
-            r'href=[\'"](/video\.php\?[^\'"]*v=\d+)[^\'"]*[\'"]'
+            _add(cands, mbasic, m.group(1), "mbasic video_redirect")
+        for rx, why in [
+            (r'href=[\'"](/reel/[^\'"]+)[\'"]', "mbasic reel"),
+            (r'href=[\'"](/watch/\?v=\d+)[\'"]', "mbasic watch"),
+            (r'href=[\'"](/video\.php\?[^\'"]*v=\d+)[^\'"]*[\'"]', "mbasic video.php"),
         ]:
             m = re.search(rx, html_b, re.I)
-            if m: _add(cands, mbasic, m.group(1))
+            if m: _add(cands, mbasic, m.group(1), why)
     except Exception as e:
         log.warning("mbasic fetch failed: %s", e)
 
-    # oEmbed
+    # 4) oEmbed
     try:
         enc = urllib.parse.quote(url, safe="")
         oembed = f"https://www.facebook.com/plugins/video/oembed.json/?url={enc}"
@@ -175,16 +161,16 @@ async def fb_collect_candidates(url: str):
                     data = await resp.json()
                     html = data.get("html") or ""
                     m = re.search(r'src=[\'"]([^\'"]+plugins/video\.php\?href=[^\'"]+)[\'"]', html)
-                    if m: _add(cands, url, urllib.parse.unquote(m.group(1)))
+                    if m: _add(cands, url, urllib.parse.unquote(m.group(1)), "oEmbed plugins/video.php")
     except Exception as e:
         log.warning("oEmbed fetch failed: %s", e)
 
-    # de-dup & sort
-    seen, dedup = set(), []
+    # dedup and sort
+    seen, out = set(), []
     for c in cands:
-        if c and c not in seen:
-            seen.add(c)
-            dedup.append(c)
+        u = c["url"]
+        if u and u not in seen:
+            seen.add(u); out.append(c)
 
     def score(u):
         if "video_redirect/?src=" in u: return 0
@@ -193,9 +179,10 @@ async def fb_collect_candidates(url: str):
         if "/video.php" in u: return 3
         if "plugins/video.php" in u: return 4
         if "/story.php" in u: return 5
-        return 6
-    dedup.sort(key=score)
-    return dedup
+        if "/l.php" in u: return 6
+        return 7
+    out.sort(key=lambda c: score(c["url"]))
+    return out
 
 async def normalize_url(url: str, src: str):
     orig = url.strip()
@@ -203,26 +190,27 @@ async def normalize_url(url: str, src: str):
         orig = "https://" + orig
     url = strip_tracking_params(orig)
 
-    # redirects
-    try:
-        final_m = await fetch(url, headers=HDR_M, return_text=False)
-        if final_m: url = final_m
-    except Exception as e:
-        log.warning("normalize mobile redirect failed: %s", e)
-    try:
-        final_w = await fetch(url, headers=HDR_W, return_text=False)
-        if final_w: url = final_w
-    except Exception as e:
-        log.warning("normalize desktop redirect failed: %s", e)
+    # handle l.php unwrap quick
+    url = _unwrap_lphp(url)
+
+    # follow redirects quickly
+    for hdr in (HDR_M, HDR_W):
+        try:
+            final = await http_get(url, headers=hdr, return_text=False)
+            if final: url = final
+        except Exception as e:
+            log.warning("redirect follow failed: %s", e)
 
     candidates = []
     if src == "facebook" and ("facebook.com/share/" in url):
-        candidates = await fb_collect_candidates(url)
-        if candidates:
-            url = candidates[0]
-        p = urllib.parse.urlparse(url)
-        if "facebook.com" in p.netloc and not p.netloc.startswith("m.") and "video_redirect" not in url:
-            url = urllib.parse.urlunparse(p._replace(netloc="m.facebook.com"))
+        cands = await fb_collect_candidates(url)
+        candidates = cands
+        if cands:
+            best = cands[0]["url"]
+            p = urllib.parse.urlparse(best)
+            if "facebook.com" in p.netloc and not p.netloc.startswith("m.") and "video_redirect" not in best:
+                best = urllib.parse.unparse(p._replace(netloc="m.facebook.com"))
+            url = best
     return url, candidates
 
 def extract_first_url(text: str) -> str | None:
@@ -272,8 +260,22 @@ async def trace_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     norm, cands = await normalize_url(url, src)
     msg = f"src={src}\noriginal={url}\nnormalized={norm}"
     if cands:
-        msg += "\ncandidates:\n" + "\n".join(f"- {c}" for c in cands[:10])
+        msg += "\ncandidates (top 10):\n" + "\n".join(f"- {c['url']}  [{c['why']}]" for c in cands[:10])
     await update.effective_chat.send_message(msg)
+
+async def tracejson_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.effective_message.text or "").strip()
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2:
+        await update.effective_chat.send_message("Dùng: /tracejson <URL>")
+        return
+    url = parts[1]
+    src = classify(url)
+    norm, cands = await normalize_url(url, src)
+    data = {"src": src, "original": url, "normalized": norm, "candidates": cands[:20]}
+    # escape markdownv2 special chars
+    s = json.dumps(data, ensure_ascii=False, indent=2).replace("\\","\\\\").replace("_","\\_").replace("*","\\*").replace("[","\\[").replace("]","\\]").replace("(","\\(").replace(")","\\)").replace("~","\\~").replace("`","\\`").replace(">","\\>").replace("#","\\#").replace("+","\\+").replace("-","\\-").replace("=","\\=").replace("|","\\|").replace("{","\\{").replace("}","\\}").replace(".","\\.")
+    await update.effective_chat.send_message("```json\n" + s + "\n```", parse_mode="MarkdownV2")
 
 async def get_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.effective_message.text or "").strip()
@@ -311,7 +313,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         norm_url, cands = await normalize_url(url, src)
         log.info("Normalized URL: %s", norm_url)
-        if cands: log.info("Candidates: %s", cands)
+        if cands: log.info("Candidates: %s", cands[:5])
     except Exception as e:
         log.warning("normalize_url error: %s", e)
         norm_url, cands = url, []
@@ -344,8 +346,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if src == "facebook" and ("facebook.com/share/" in norm_url):
         msg = "Link share của Facebook chưa trỏ tới URL video cụ thể."
         if cands:
-            msg += "\nMình gợi ý các URL khả dĩ (hãy thử một trong các link sau):\n" + "\n".join(f"- {c}" for c in cands[:10])
-        msg += "\nBạn cũng có thể dùng /trace <URL> để xem chi tiết."
+            msg += "\nMình gợi ý các URL khả dĩ:\n" + "\n".join(f"- {c['url']}  [{c['why']}]" for c in cands[:10])
+        msg += "\nBạn cũng có thể dùng /trace hoặc /tracejson để xem chi tiết."
         await chat.send_message(msg)
         return
 
@@ -356,7 +358,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     cookies_path = os.environ.get("YTDLP_COOKIES")
     headers = {
-        "User-Agent": UA_FB_M if src == "facebook" else ua_default(),
+        "User-Agent": UA_FB_M if src == "facebook" else UA_FB_W,
         "Referer": "https://m.facebook.com/" if src == "facebook" else "https://www.google.com",
         "Accept-Language": "en-US,en;q=0.9,vi;q=0.8"
     }
@@ -442,19 +444,6 @@ async def start_web():
     await site.start()
     log.info("HTTP server started on 0.0.0.0:%s", PORT)
 
-async def retry_telegram(call, what="tg-call", tries=8, base_delay=1.5):
-    for i in range(tries):
-        try:
-            return await call()
-        except RetryAfter as e:
-            delay = getattr(e, "retry_after", 5)
-        except (TimedOut, NetworkError):
-            delay = base_delay * (2 ** i)
-        except Exception:
-            raise
-        await asyncio.sleep(min(delay, 30))
-    raise TimedOut(f"{what} timed out after retries")
-
 async def start_polling():
     if not BOT_TOKEN:
         log.error("Missing TELEGRAM_TOKEN environment variable.")
@@ -462,13 +451,13 @@ async def start_polling():
             await asyncio.sleep(60)
 
     log.info("BOT_TOKEN seems set (length=%d, masked).", len(BOT_TOKEN))
-
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("ping", ping_cmd))
     app.add_handler(CommandHandler("debug", debug_cmd))
     app.add_handler(CommandHandler("cookiecheck", cookiecheck_cmd))
     app.add_handler(CommandHandler("trace", trace_cmd))
+    app.add_handler(CommandHandler("tracejson", tracejson_cmd))
     app.add_handler(CommandHandler("get", get_cmd))
     app.add_handler(MessageHandler(filters.ALL & (~filters.COMMAND), handle_message))
 
@@ -478,18 +467,16 @@ async def start_polling():
 
     for fn, name in ((_init, "app.initialize"), (_delwh, "delete_webhook"), (_start, "app.start")):
         try:
-            await retry_telegram(fn, name)
-            if name == "delete_webhook":
-                log.info("Webhook deleted (if existed).")
+            await retry_telegram(fn, name="startup")
         except Exception as e:
-            log.warning("%s failed (continue running): %s", name, e)
+            log.warning("%s failed (continue): %s", name, e)
 
     log.info("Polling starting...")
     try:
         await app.updater.start_polling(allowed_updates=None, timeout=60, poll_interval=0.8)
         log.info("Polling started and running.")
     except Exception as e:
-        log.exception("start_polling failed (will keep process alive): %s", e)
+        log.exception("start_polling failed: %s", e)
 
     while True:
         await asyncio.sleep(60)

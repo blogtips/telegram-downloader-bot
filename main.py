@@ -1,10 +1,13 @@
 ﻿import os
 import yt_dlp
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import FSInputFile
+from aiogram.types import InputFile   # <— dùng InputFile thay cho FSInputFile
 from aiogram.utils import executor
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")  # lấy token từ Render Environment
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise RuntimeError("Missing BOT_TOKEN environment variable")
+
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
 
@@ -12,10 +15,11 @@ def download_video(url: str, filename: str = "video.mp4"):
     """Tải video từ link bằng yt-dlp"""
     ydl_opts = {
         "outtmpl": filename,
-        "format": "mp4",
-        "quiet": True,
-        "noplaylist": True,
+        # cố gắng lấy mp4; nếu site tách audio/video, yt-dlp sẽ merge bằng ffmpeg
+        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
         "merge_output_format": "mp4",
+        "noplaylist": True,
+        "quiet": True,
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
@@ -27,17 +31,22 @@ async def start(msg: types.Message):
 
 @dp.message_handler()
 async def handle_url(msg: types.Message):
-    url = msg.text.strip()
+    url = (msg.text or "").strip()
     if any(x in url for x in ["tiktok.com", "douyin.com", "facebook.com", "fb.watch", "instagram.com"]):
         await msg.reply("⏳ Đang tải video...")
+        filename = "video.mp4"
         try:
-            filename = "video.mp4"
             download_video(url, filename)
-            video = FSInputFile(filename)
+            video = InputFile(filename)  # <— dùng InputFile
             await msg.reply_video(video)
-            os.remove(filename)
         except Exception as e:
             await msg.reply(f"❌ Lỗi: {e}")
+        finally:
+            try:
+                if os.path.exists(filename):
+                    os.remove(filename)
+            except Exception:
+                pass
     else:
         await msg.reply("Không nhận diện được link.")
 

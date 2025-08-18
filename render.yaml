@@ -1,8 +1,13 @@
 services:
-  - type: worker
+  - type: web
     name: telegram-video-bot
     env: docker
     dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /
+    autoDeploy: true
     envVars:
       - key: BOT_TOKEN
-        sync: false
+        sync: false          # set trong Dashboard
+      - key: WEBHOOK_BASE_URL
+        sync: false          # (recommend) set = https://<ten-service>.onrender.com
